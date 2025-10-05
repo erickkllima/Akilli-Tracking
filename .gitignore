@@ -1,0 +1,20 @@
+# Ambiente virtual
+.venv/
+__pycache__/
+*.pyc
+
+# Configs locais
+.env
+.env.*
+
+# Cache do Vite/React
+node_modules/
+dist/
+
+# Arquivos temporários
+.DS_Store
+.vscode/
+.idea/
+*.log
+*.sqlite3
+monitorx.db
