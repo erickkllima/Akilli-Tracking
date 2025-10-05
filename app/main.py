@@ -23,6 +23,51 @@ class TagUpdate(BaseModel):
 
 app = FastAPI(title="MonitorX - MVP", version="0.1")
 
+from fastapi import APIRouter
+from sqlmodel import text
+from app.db import engine
+import os
+
+debug_router = APIRouter()
+
+@debug_router.get("/healthz")
+def healthz():
+    return {"status": "ok", "service": "MonitorX API"}
+
+@debug_router.get("/debug/db_ping")
+def debug_db_ping():
+    # Mostra como a URL foi montada (sem senha)
+    url = os.getenv("DATABASE_URL", "") or "built_from_parts"
+    parts = {
+        "DB_HOST": os.getenv("DB_HOST"),
+        "DB_PORT": os.getenv("DB_PORT"),
+        "DB_NAME": os.getenv("DB_NAME"),
+        "DB_USER": os.getenv("DB_USER"),
+        "DB_HOSTADDR": os.getenv("DB_HOSTADDR"),
+    }
+    try:
+        with engine.connect() as conn:
+            r = conn.exec_driver_sql("select version();")
+            version = r.fetchone()[0]
+            r2 = conn.exec_driver_sql("select current_database(), inet_server_addr(), inet_client_addr();")
+            dbname, srv_ip, cli_ip = r2.fetchone()
+        ok = True
+        info = {"version": version, "db": dbname, "server_ip": str(srv_ip), "client_ip": str(cli_ip)}
+    except Exception as e:
+        ok = False
+        info = {"error": str(e)}
+
+    return {
+        "ok": ok,
+        "using": "DATABASE_URL" if os.getenv("DATABASE_URL") else "parts",
+        "raw_database_url_present": bool(os.getenv("DATABASE_URL")),
+        "env_parts": parts,
+        "probe": info,
+    }
+
+app.include_router(debug_router)
+
+
 # CORS liberado no MVP
 app.add_middleware(
     CORSMiddleware,
