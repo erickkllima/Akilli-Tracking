@@ -1,68 +1,90 @@
 # app/db.py
+from __future__ import annotations
 import os
-from urllib.parse import quote_plus
-from sqlmodel import SQLModel, create_engine, Session
+from typing import Optional
+from sqlalchemy import create_engine
+from sqlmodel import Session, SQLModel
 
-def _normalize_url(url: str) -> str:
-    url = url.strip()
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+psycopg://", 1)
-    elif url.startswith("postgresql://") and "+psycopg" not in url:
-        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
-    return url
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    return v.strip() if isinstance(v, str) else default
 
-def _build_url_from_parts() -> str | None:
-    host = os.getenv("DB_HOST")
-    port = os.getenv("DB_PORT")
-    name = os.getenv("DB_NAME")
-    user = os.getenv("DB_USER")
-    pwd  = os.getenv("DB_PASSWORD")
-    hostaddr = os.getenv("DB_HOSTADDR")  # IPv4 opcional (força IPv4)
+def build_database_url_from_parts() -> str:
+    host = _env("DB_HOST", "")
+    port = _env("DB_PORT", "5432")
+    db   = _env("DB_NAME", "postgres")
+    user = _env("DB_USER", "")
+    pwd  = _env("DB_PASSWORD", "")
 
-    if all([host, port, name, user, pwd]):
-        user_q = quote_plus(user)
-        pwd_q  = quote_plus(pwd)
-        qparams = ["sslmode=require", "connect_timeout=10", "application_name=render"]
-        if hostaddr:
-            qparams.append(f"hostaddr={hostaddr}")
-        query = "&".join(qparams)
-        return f"postgresql+psycopg://{user_q}:{pwd_q}@{host}:{port}/{name}?{query}"
-    return None
+    # hostaddr força IPv4 se fornecido (o psycopg usa hostaddr no handshake)
+    hostaddr = _env("DB_HOSTADDR", None)
 
-# 1) Tenta partes (mais seguro)
-DATABASE_URL = _build_url_from_parts()
+    base = f"postgresql+psycopg://{user}:{pwd}@{host}:{port}/{db}"
+    params = [
+        "sslmode=require",
+        "connect_timeout=10",
+        "application_name=render",
+    ]
+    # Se hostaddr vier, passamos na querystring (psycopg3 respeita libpq params)
+    if hostaddr:
+        params.append(f"hostaddr={hostaddr}")
 
-# 2) Se não houver, usa DATABASE_URL bruta e normaliza prefixo
-if not DATABASE_URL:
-    raw = os.getenv("DATABASE_URL", "")
-    if raw:
-        DATABASE_URL = _normalize_url(raw)
+    return base + "?" + "&".join(params)
 
-if DATABASE_URL:
-    # log enxuto (sem senha)
+# 1) Respeita DATABASE_URL se existir. 2) Senão, monta das partes.
+if os.getenv("DATABASE_URL"):
+    DATABASE_URL = os.getenv("DATABASE_URL").strip()
+    _printed_url = DATABASE_URL
+    # ofusca senha ao imprimir
+    if "://" in _printed_url and "@" in _printed_url:
+        try:
+            scheme, rest = _printed_url.split("://", 1)
+            creds, tail = rest.split("@", 1)
+            if ":" in creds:
+                user, _pw = creds.split(":", 1)
+                _printed_url = f"{scheme}://{user}:***@{tail}"
+        except Exception:
+            pass
+    print(f"[DB] Using DATABASE_URL: {_printed_url}")
+else:
+    DATABASE_URL = build_database_url_from_parts()
+    # imprime URL sem senha
+    safe = DATABASE_URL
     try:
-        safe_url = DATABASE_URL
-        if "://" in safe_url and "@" in safe_url:
-            # mascara credenciais
-            scheme, rest = safe_url.split("://", 1)
-            user_pass, host_part = rest.split("@", 1)
-            if ":" in user_pass:
-                user = user_pass.split(":")[0]
-            else:
-                user = user_pass
-            safe_url = f"{scheme}://{user}:***@{host_part}"
-        print(f"[DB] Using DATABASE_URL: {safe_url}")
+        scheme, rest = safe.split("://", 1)
+        creds, tail = rest.split("@", 1)
+        if ":" in creds:
+            user, _pw = creds.split(":", 1)
+            safe = f"{scheme}://{user}:***@{tail}"
     except Exception:
         pass
+    print(f"[DB] Using DATABASE_URL: {safe}")
 
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-else:
-    print("[DB] No DATABASE_URL found; using SQLite local.")
-    engine = create_engine("sqlite:///./monitorx.db", connect_args={"check_same_thread": False})
+# Ajustes pró-pooler / pró-ambiente serverless
+CONNECT_ARGS = {
+    # Já exigimos ssl via querystring, mas manter aqui não atrapalha
+    "sslmode": "require",
+    # Em pgBouncer (especialmente Transaction), prepared statements podem causar reset.
+    # Em psycopg3 dá para desabilitar server-side prepare definindo 'prepare_threshold' como 0:
+    "prepare_threshold": 0,
+    # Opcional: evita cair em réplica acidentalmente (em alguns setups)
+    "target_session_attrs": "read-write",
+    # Exemplo de timeout por sessão (30s)
+    # "options": "-c statement_timeout=30000",
+}
 
-def init_db():
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,   # reabre conexões quebradas
+    pool_recycle=300,     # recicla conexões periodicamente
+    pool_size=5,
+    max_overflow=10,
+    connect_args=CONNECT_ARGS,
+)
+
+def init_db() -> None:
+    from app.models import SQLModel  # evita import circular
     SQLModel.metadata.create_all(engine)
 
-def get_session():
-    with Session(engine) as s:
-        yield s
+def get_session() -> Session:
+    return Session(engine)
