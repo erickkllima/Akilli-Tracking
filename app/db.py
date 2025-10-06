@@ -1,102 +1,71 @@
 # app/db.py
-from __future__ import annotations
 import os
-import socket
-from typing import Optional
 from sqlalchemy import create_engine
-from sqlmodel import Session, SQLModel
+from sqlalchemy.orm import sessionmaker
+from sqlmodel import SQLModel
+from urllib.parse import quote_plus
 
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    return v.strip() if isinstance(v, str) else default
+def _from_env_trim(key: str) -> str | None:
+    v = os.getenv(key)
+    if v is None: 
+        return None
+    v = v.strip()
+    return v or None
 
-def _resolve_ipv4(host: str) -> Optional[str]:
-    """
-    Resolve o IPv4 (A record) do host. Se não conseguir, retorna None.
-    Isso evita depender do ambiente do Render/Windows devolver AAAA (IPv6).
-    """
-    try:
-        # AF_INET => só IPv4; getaddrinfo retorna [(family, socktype, proto, canonname, sockaddr), ...]
-        infos = socket.getaddrinfo(host, None, family=socket.AF_INET)
-        for family, _, _, _, sockaddr in infos:
-            if family == socket.AF_INET and sockaddr and len(sockaddr) >= 1:
-                return sockaddr[0]  # IP v4
-    except Exception:
-        pass
-    return None
+def build_database_url() -> str:
+    # Se o usuário deixou DATABASE_URL pronto e válido, use.
+    raw = _from_env_trim("DATABASE_URL")
+    if raw and raw.startswith(("postgresql://", "postgresql+psycopg://")):
+        return raw
 
-def build_database_url_from_parts() -> str:
-    host = _env("DB_HOST", "")
-    port = _env("DB_PORT", "5432")
-    db   = _env("DB_NAME", "postgres")
-    user = _env("DB_USER", "")
-    pwd  = _env("DB_PASSWORD", "")
+    host = _from_env_trim("DB_HOST") or ""
+    # se colaram a connection string inteira por engano no DB_HOST, limpe
+    if host.startswith("postgresql://"):
+        host = host.split("@", 1)[-1]
+        if "/" in host:
+            host = host.split("/", 1)[0]
+        if ":" in host:
+            host = host.split(":", 1)[0]
 
-    # Se o usuário não definiu DB_HOSTADDR, tentamos resolver IPv4 automaticamente
-    hostaddr = _env("DB_HOSTADDR", None)
-    if not hostaddr and host:
-        hostaddr = _resolve_ipv4(host)
+    port = _from_env_trim("DB_PORT") or "6543"  # pooler
+    name = _from_env_trim("DB_NAME") or "postgres"
+    user = _from_env_trim("DB_USER") or ""
+    pwd  = _from_env_trim("DB_PASSWORD") or ""
+    hostaddr = _from_env_trim("DB_HOSTADDR")  # opcional, força IPv4
 
-    base = f"postgresql+psycopg://{user}:{pwd}@{host}:{port}/{db}"
+    # senha url-encoded
+    pwd_q = quote_plus(pwd)
+
     params = [
         "sslmode=require",
         "connect_timeout=10",
         "application_name=render",
-        "target_session_attrs=read-write",
     ]
     if hostaddr:
-        params.append(f"hostaddr={hostaddr}")  # psycopg3 aceita libpq params na querystring
+        params.append(f"hostaddr={hostaddr}")
 
-    return base + "?" + "&".join(params)
+    query = "&".join(params)
+    url = f"postgresql+psycopg://{user}:{pwd_q}@{host}:{port}/{name}?{query}"
+    print(f"[DB] Using DATABASE_URL: postgresql+psycopg://{user}:***@{host}:{port}/{name}?{query}")
+    return url
 
-# 1) Usa DATABASE_URL se existir; 2) senão, monta das partes
-if os.getenv("DATABASE_URL"):
-    DATABASE_URL = os.getenv("DATABASE_URL").strip()
-    _printed_url = DATABASE_URL
-    # ofusca a senha ao logar
-    if "://" in _printed_url and "@" in _printed_url:
-        try:
-            scheme, rest = _printed_url.split("://", 1)
-            creds, tail = rest.split("@", 1)
-            if ":" in creds:
-                user, _pw = creds.split(":", 1)
-                _printed_url = f"{scheme}://{user}:***@{tail}"
-        except Exception:
-            pass
-    print(f"[DB] Using DATABASE_URL: {_printed_url}")
-else:
-    DATABASE_URL = build_database_url_from_parts()
-    # imprime URL sem senha
-    safe = DATABASE_URL
-    try:
-        scheme, rest = safe.split("://", 1)
-        creds, tail = rest.split("@", 1)
-        if ":" in creds:
-            user, _pw = creds.split(":", 1)
-            safe = f"{scheme}://{user}:***@{tail}"
-    except Exception:
-        pass
-    print(f"[DB] Using DATABASE_URL: {safe}")
-
-CONNECT_ARGS = {
-    "sslmode": "require",
-    "prepare_threshold": 0,  # amigável a poolers; inofensivo na conexão direta
-    "target_session_attrs": "read-write",
-    # "options": "-c statement_timeout=30000",  # opcional
-}
+DATABASE_URL = build_database_url()
 
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=300,
     pool_size=5,
-    max_overflow=10,
-    connect_args=CONNECT_ARGS,
+    max_overflow=5,
 )
 
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 def init_db() -> None:
-    from app.models import SQLModel  # evita import circular
     SQLModel.metadata.create_all(engine)
 
-def get_session() -> Session:
-    return Session(engine)
+def get_session():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
